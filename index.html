@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <title>ASphere — RAG Content Generator</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+      padding: 30px;
+      max-width: 1000px;
+      margin: auto;
+    }
+    h1, h2 { color: #38bdf8; }
+    textarea, input, select, button {
+      width: 100%;
+      padding: 10px;
+      margin: 8px 0;
+      border-radius: 6px;
+      border: none;
+    }
+    textarea { height: 100px; }
+    button {
+      background: #38bdf8;
+      color: #020617;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    .card {
+      background: #020617;
+      padding: 15px;
+      border-radius: 8px;
+      margin-top: 15px;
+    }
+    .success { color: #22c55e; font-size: 14px; }
+    .error { color: #ef4444; font-size: 14px; }
+    img, video, iframe {
+      max-width: 100%;
+      margin-top: 10px;
+      border-radius: 6px;
+    }
+    .small { opacity: .8; font-size: 12px; }
+  </style>
+</head>
+
+<body>
+
+<h1>🧠 ASphere — RAG + Génération de posts</h1>
+
+<div class="card">
+  <h2>1️⃣ Sources RAG</h2>
+
+  <label>🔗 Liens web (1 par ligne)</label>
+  <textarea id="urls" placeholder="https://site1.com/article"></textarea>
+
+  <label>📎 Documents (PDF / TXT)</label>
+  <input type="file" id="files" multiple />
+
+  <button onclick="ingestRAG()">📚 Indexer pour le RAG</button>
+  <div id="rag_status" class="small"></div>
+
+  <hr style="border: none; border-top: 1px solid #1f2937; margin: 12px 0;" />
+
+  <label>🔎 Debug RAG (optionnel)</label>
+  <input id="debug_query" placeholder="Tape une requête pour voir les chunks récupérés" />
+  <button onclick="debugRAG()">🧪 Voir retrieval</button>
+  <pre id="debug_out" style="white-space: pre-wrap;"></pre>
+</div>
+
+<div class="card">
+  <h2>2️⃣ Génération de posts</h2>
+
+  <textarea id="prompt" placeholder="Génère 3 posts LinkedIn basés sur les sources ci-dessus"></textarea>
+
+  <label>Nombre de posts</label>
+  <input type="number" id="n_posts" value="3" min="1" max="10">
+
+  <label>Type de post</label>
+  <select id="post_type">
+    <option>Texte + Image</option>
+    <option>Texte + Vidéo</option>
+    <option>Texte + PDF</option>
+  </select>
+
+  <button onclick="generatePosts()">⚡ Générer</button>
+</div>
+
+<div id="posts"></div>
+
+<script>
+const API = "http://127.0.0.1:8000";
+let uploadedFilePaths = [];
+
+async function ingestRAG() {
+  const status = document.getElementById("rag_status");
+  status.innerHTML = "⏳ Indexation en cours...";
+
+  uploadedFilePaths = [];
+  const files = document.getElementById("files").files;
+
+  try {
+    for (const file of files) {
+      const fd = new FormData();
+      fd.append("file", file);
+
+      const res = await fetch(`${API}/upload`, { method: "POST", body: fd });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Upload failed");
+      uploadedFilePaths.push(data.path);
+    }
+
+    const urls = document.getElementById("urls").value
+      .split("\n").map(u => u.trim()).filter(Boolean);
+
+    const res = await fetch(`${API}/rag/ingest`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ urls, file_paths: uploadedFilePaths })
+    });
+
+    const data = await res.json();
+
+    status.innerHTML = res.ok
+      ? `<span class="success">✅ RAG indexé (${data.chunks} chunks, ${data.total_sources} docs)</span>`
+      : `<span class="error">❌ ${data.detail || "Erreur ingestion"}</span>`;
+  } catch (e) {
+    status.innerHTML = `<span class="error">❌ ${e.message}</span>`;
+  }
+}
+
+async function debugRAG() {
+  const q = document.getElementById("debug_query").value.trim();
+  const out = document.getElementById("debug_out");
+  out.textContent = "⏳ Debug...";
+
+  try {
+    const res = await fetch(`${API}/rag/debug?query=${encodeURIComponent(q)}&k=5`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Debug failed");
+    out.textContent = JSON.stringify(data, null, 2);
+  } catch (e) {
+    out.textContent = "❌ " + e.message;
+  }
+}
+
+async function generatePosts() {
+  const container = document.getElementById("posts");
+  container.innerHTML = "⏳ Génération en cours...";
+
+  try {
+    const res = await fetch(`${API}/generate-with-media`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        prompt: document.getElementById("prompt").value,
+        n_posts: parseInt(document.getElementById("n_posts").value, 10),
+        post_type: document.getElementById("post_type").value,
+        use_rag: true,
+        rag_k: 5
+      })
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Génération failed");
+
+    container.innerHTML = "";
+
+    data.posts.forEach((p, i) => {
+      const div = document.createElement("div");
+      div.className = "card";
+
+      let media = "";
+      if (p.media_url.endsWith(".png")) media = `<img src="${p.media_url}">`;
+      if (p.media_url.endsWith(".mp4")) media = `<video src="${p.media_url}" controls></video>`;
+      if (p.media_url.endsWith(".pdf")) media = `<iframe src="${p.media_url}" height="420"></iframe>`;
+
+      div.innerHTML = `
+        <h2>Post ${i + 1}</h2>
+        <textarea>${p.texte}</textarea>
+        ${media}
+        <div class="small">Media: ${p.media_url}</div>
+      `;
+      container.appendChild(div);
+    });
+
+  } catch (e) {
+    container.innerHTML = `<div class="card error">❌ ${e.message}</div>`;
+  }
+}
+</script>
+
+</body>
+</html>

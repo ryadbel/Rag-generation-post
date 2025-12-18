@@ -1,0 +1,7 @@
+# Environnements virtuels Python
+env/
+data/
+.myenv/
+__pycache__/
+.env
+.venv/
