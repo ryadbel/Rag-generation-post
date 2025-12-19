@@ -1,15 +1,11 @@
 #########################################################
-# ASphere API — FINAL STABLE VERSION (Windows Safe)
-# RAG HTML + FAISS + Media (NO Playwright)
+# ASphere API — FINAL BACKEND
 #########################################################
 
-import os
-import json
-import base64
-import shutil
-import tempfile
+import os, re, json, uuid, base64, shutil, tempfile
+from datetime import datetime
+from typing import List, Optional
 from io import BytesIO
-from typing import List, Literal, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -18,20 +14,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from openai import OpenAI
+from reportlab.pdfgen import canvas
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-from reportlab.pdfgen import canvas
 from moviepy.editor import VideoClip
 
-# LangChain
 from langchain_community.document_loaders import WebBaseLoader, PyPDFLoader, TextLoader
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 
-# ======================================================
-# ENV
-# ======================================================
+# ---------------- ENV ----------------
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -39,17 +32,21 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-UPLOAD_DIR = "data/uploads"
-VECTOR_DIR = "data/vectorstore"
+BASE = "data"
+UPLOAD_DIR = os.path.join(BASE, "uploads")
+VECTOR_DIR = os.path.join(BASE, "vectorstore")
+HISTORY_FILE = os.path.join(BASE, "media_history.json")
+
+os.makedirs(BASE, exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
-EMBED_MODEL = "text-embedding-3-small"
+if not os.path.exists(HISTORY_FILE):
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump([], f, indent=2, ensure_ascii=False)
 
-# ======================================================
-# FASTAPI
-# ======================================================
-app = FastAPI(title="ASphere API", version="1.0.0")
+# ---------------- FASTAPI ----------------
+app = FastAPI(title="ASphere API — Final", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,115 +55,96 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ======================================================
-# MODELS
-# ======================================================
-PostType = Literal["Texte + Image", "Texte + Vidéo", "Texte + PDF"]
-
-class UploadResponse(BaseModel):
-    path: str
-
+# ---------------- MODELS ----------------
 class RagIngestRequest(BaseModel):
     urls: List[str] = Field(default_factory=list)
     file_paths: List[str] = Field(default_factory=list)
 
 class GenerateRequest(BaseModel):
-    prompt: str
-    n_posts: int = 3
-    post_type: PostType
-    use_rag: bool = True
-    rag_k: int = 5
+    prompt: Optional[str] = ""
+    use_rag: Optional[bool] = False  # Par défaut FALSE
+    rag_k: Optional[int] = 5
+    post_type: Optional[str] = "Texte + Image"
 
-# ======================================================
-# UTILS
-# ======================================================
+class RegenerateImageRequest(BaseModel):
+    previous_image_id: str
+    new_prompt: str
+
+# ---------------- UTILS ----------------
 def embeddings():
-    return OpenAIEmbeddings(model=EMBED_MODEL)
+    return OpenAIEmbeddings(model="text-embedding-3-small")
 
 def normalize_urls(urls: List[str]) -> List[str]:
-    fixed = []
+    out = []
     for u in urls:
         u = (u or "").strip()
         if not u:
             continue
         if not u.startswith("http"):
             u = "https://" + u
-        fixed.append(u)
-    return fixed
+        out.append(u)
+    return out
 
-def load_vectorstore() -> Optional[FAISS]:
-    if not os.path.exists(f"{VECTOR_DIR}/index.faiss"):
+def extract_n_posts(prompt: str, default=1, max_posts=5):
+    m = re.search(r"(\d+)\s*posts?", prompt.lower())
+    if m:
+        return min(max(int(m.group(1)), 1), max_posts)
+    return default
+
+def load_vectorstore():
+    if not os.path.exists(os.path.join(VECTOR_DIR, "index.faiss")):
         return None
-    return FAISS.load_local(
-        VECTOR_DIR,
-        embeddings(),
-        allow_dangerous_deserialization=True
-    )
+    return FAISS.load_local(VECTOR_DIR, embeddings(), allow_dangerous_deserialization=True)
 
-def upload_tmpfile(data: bytes, filename: str) -> str:
+def upload_tmpfile(data: bytes, name: str) -> str:
     r = requests.post(
         "https://tmpfiles.org/api/v1/upload",
-        files={"file": (filename, data)},
+        files={"file": (name, data)},
         timeout=60
     )
     r.raise_for_status()
-    js = r.json()
-    return js["data"]["url"].replace("tmpfiles.org/", "tmpfiles.org/dl/")
+    return r.json()["data"]["url"].replace("tmpfiles.org/", "tmpfiles.org/dl/")
 
-# ======================================================
-# MEDIA
-# ======================================================
-def generate_image(text: str) -> bytes:
+def load_history():
+    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_history(h):
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(h, f, indent=2, ensure_ascii=False)
+
+def store_media(**kwargs):
+    h = load_history()
+    rec = {
+        "id": str(uuid.uuid4()),
+        "created_at": datetime.utcnow().isoformat(),
+        "forgotten": False,
+        **kwargs
+    }
+    h.append(rec)
+    save_history(h)
+    return rec
+
+# ---------------- MEDIA ----------------
+def generate_image(prompt: str) -> bytes:
     img = client.images.generate(
-        model="gpt-image-1",
-        prompt=f"Image professionnelle sans texte illustrant : {text}",
-        size="1024x1024"
+        model="dall-e-3",
+        prompt=prompt,
+        size="1024x1024",
+        n=1
     )
-    return base64.b64decode(img.data[0].b64_json)
+    img_url = img.data[0].url
+    response = requests.get(img_url)
+    return response.content
 
-def generate_pdf(text: str) -> bytes:
-    buf = BytesIO()
-    pdf = canvas.Canvas(buf)
-    pdf.setFont("Helvetica", 12)
-    y = 800
-    for line in text.split("\n"):
-        if y < 50:
-            pdf.showPage()
-            pdf.setFont("Helvetica", 12)
-            y = 800
-        pdf.drawString(50, y, line[:120])
-        y -= 18
-    pdf.save()
-    buf.seek(0)
-    return buf.getvalue()
-
-def generate_video(text: str) -> bytes:
-    W, H = 1024, 1024
-    font = ImageFont.load_default()
-
-    def frame(t):
-        img = Image.new("RGB", (W, H), "black")
-        draw = ImageDraw.Draw(img)
-        draw.text((60, H // 2), text[:300], fill="white", font=font)
-        return np.array(img)
-
-    with tempfile.TemporaryDirectory() as d:
-        path = f"{d}/video.mp4"
-        VideoClip(frame, duration=3).write_videofile(
-            path, fps=24, codec="libx264", audio=False, logger=None
-        )
-        return open(path, "rb").read()
-
-# ======================================================
-# ROUTES
-# ======================================================
+# ---------------- ROUTES ----------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-@app.post("/upload", response_model=UploadResponse)
+@app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-    path = f"{UPLOAD_DIR}/{file.filename}"
+    path = os.path.join(UPLOAD_DIR, file.filename)
     with open(path, "wb") as f:
         shutil.copyfileobj(file.file, f)
     return {"path": path}
@@ -175,128 +153,167 @@ async def upload(file: UploadFile = File(...)):
 def rag_ingest(req: RagIngestRequest):
     docs = []
 
-    # URLs (HTML classique uniquement)
-    for url in normalize_urls(req.urls):
-        loaded = WebBaseLoader(url).load()
-        usable = [
-            d for d in loaded
-            if d.page_content and len(d.page_content.strip()) > 200
-        ]
-        docs += usable
+    for u in normalize_urls(req.urls):
+        try:
+            loaded = WebBaseLoader(u).load()
+            docs += [d for d in loaded if d.page_content and len(d.page_content.strip()) > 200]
+        except Exception as e:
+            print(f"Erreur chargement {u}: {e}")
 
-    # Files
     for p in req.file_paths:
         if not os.path.exists(p):
             raise HTTPException(400, f"File not found: {p}")
-        if p.lower().endswith(".pdf"):
-            docs += PyPDFLoader(p).load()
-        else:
-            docs += TextLoader(p, encoding="utf-8").load()
+        try:
+            if p.lower().endswith(".pdf"):
+                docs += PyPDFLoader(p).load()
+            else:
+                docs += TextLoader(p, encoding="utf-8").load()
+        except Exception as e:
+            print(f"Erreur fichier {p}: {e}")
 
-    # FILTER EMPTY CONTENT
-    docs = [
-        d for d in docs
-        if d.page_content and len(d.page_content.strip()) > 200
-    ]
-
+    docs = [d for d in docs if d.page_content and len(d.page_content.strip()) > 200]
     if not docs:
-        raise HTTPException(
-            400,
-            "Sources chargées mais aucun texte exploitable "
-            "(site vitrine / HTML pauvre / PDF scanné)"
-        )
+        raise HTTPException(400, "Aucune source exploitable (HTML vide / PDF scanné)")
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150
-    )
-    chunks = splitter.split_documents(docs)
-
-    if not chunks:
-        raise HTTPException(400, "Découpage en chunks vide")
+    chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(docs)
 
     vs = load_vectorstore()
     if vs:
         vs.add_documents(chunks)
     else:
         vs = FAISS.from_documents(chunks, embeddings())
-
     vs.save_local(VECTOR_DIR)
-    return {"chunks": len(chunks)}
+
+    return {"chunks": len(chunks), "message": "Index RAG créé avec succès"}
+
 @app.get("/rag/debug")
 def rag_debug(query: str, k: int = 5):
     vs = load_vectorstore()
     if not vs:
         raise HTTPException(400, "RAG non initialisé")
-
     hits = vs.similarity_search_with_score(query, k=k)
+    return [{"score": float(s), "content": d.page_content[:400]} for d, s in hits]
 
-    return [
-        {
-            "score": float(score),
-            "content": doc.page_content[:400]
-        }
-        for doc, score in hits
-    ]
-
-
+@app.get("/rag/status")
+def rag_status():
+    """Vérifie si le RAG est initialisé"""
+    vs = load_vectorstore()
+    return {
+        "initialized": vs is not None,
+        "index_exists": os.path.exists(os.path.join(VECTOR_DIR, "index.faiss"))
+    }
 
 @app.post("/generate-with-media")
-def generate(req: GenerateRequest):
-    context = ""
+def generate_with_media(req: GenerateRequest):
+    if not req.prompt or not req.prompt.strip():
+        raise HTTPException(400, "Le prompt est vide")
 
+    post_type = req.post_type if req.post_type in ["Texte + Image"] else "Texte + Image"
+    n_posts = extract_n_posts(req.prompt)
+
+    context = ""
     if req.use_rag:
         vs = load_vectorstore()
         if not vs:
-            raise HTTPException(400, "RAG activé mais index absent")
-        retrieved = vs.similarity_search(req.prompt, k=req.rag_k)
-        if not retrieved:
-            raise HTTPException(400, "RAG vide")
+            raise HTTPException(400, "RAG activé mais index absent. Veuillez d'abord indexer des sources.")
+        retrieved = vs.similarity_search(req.prompt, k=req.rag_k or 5)
         context = "\n\n---\n\n".join(d.page_content for d in retrieved)
 
-    response = client.chat.completions.create(
+    llm_prompt = f"""
+{"CONTEXTE RAG:" if context else ""}
+{context}
+
+INSTRUCTION:
+Tu dois générer EXACTEMENT {n_posts} posts distincts pour les réseaux sociaux.
+
+PROMPT UTILISATEUR:
+{req.prompt}
+
+FORMAT JSON STRICT (renvoie uniquement ce JSON, rien d'autre):
+{{"posts":[{{"texte":"contenu du post 1"}},{{"texte":"contenu du post 2"}}]}}
+"""
+
+    res = client.chat.completions.create(
         model="gpt-4o-mini",
         response_format={"type": "json_object"},
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Tu es un générateur de posts basé sur RAG.\n"
-                    "Tu DOIS utiliser exclusivement le CONTEXTE.\n"
-                    "Retourne STRICTEMENT le JSON demandé."
-                )
-            },
-            {
-                "role": "user",
-                "content": f"""
-CONTEXTE:
-{context}
-
-PROMPT:
-{req.prompt}
-
-FORMAT:
-{{ "posts": [{{"texte":"..."}},{{"texte":"..."}}] }}
-
-NOMBRE: {req.n_posts}
-"""
-            }
+            {"role": "system", "content": "Tu es un expert en création de contenu pour réseaux sociaux. Retourne uniquement du JSON valide."},
+            {"role": "user", "content": llm_prompt}
         ]
     )
 
-    posts = json.loads(response.choices[0].message.content)["posts"]
-    result = []
+    posts = json.loads(res.choices[0].message.content).get("posts", [])[:n_posts]
+    out = []
 
     for i, p in enumerate(posts, 1):
-        texte = p["texte"]
+        text = (p.get("texte") or "").strip()
+        if not text:
+            continue
 
-        if req.post_type == "Texte + Image":
-            media = upload_tmpfile(generate_image(texte), f"post_{i}.png")
-        elif req.post_type == "Texte + Vidéo":
-            media = upload_tmpfile(generate_video(texte), f"post_{i}.mp4")
-        else:
-            media = upload_tmpfile(generate_pdf(texte), f"post_{i}.pdf")
+        img_prompt = f"Professional social media illustration, modern and clean design, no text overlay: {text[:200]}"
+        
+        try:
+            img = generate_image(img_prompt)
+            url = upload_tmpfile(img, f"post_{i}.png")
+        except Exception as e:
+            print(f"Erreur génération image: {e}")
+            url = "https://via.placeholder.com/1024x1024?text=Image+Error"
 
-        result.append({"texte": texte, "media_url": media})
+        out.append(store_media(
+            texte=text,
+            media_url=url,
+            media_type="image",
+            media_prompt=img_prompt,
+            media_description="Image générée"
+        ))
 
-    return {"posts": result}
+    return {"n_posts_detected": n_posts, "posts": out}
+
+@app.post("/image/regenerate")
+def regenerate_image(req: RegenerateImageRequest):
+    h = load_history()
+    prev = next((x for x in h if x["id"] == req.previous_image_id), None)
+    if not prev:
+        raise HTTPException(404, "Image introuvable")
+
+    combined_prompt = f"""
+Professional social media illustration, maintain overall style and composition.
+No text overlay in the image.
+
+Previous concept:
+{prev.get("media_prompt","")}
+
+New instruction:
+{req.new_prompt}
+"""
+
+    try:
+        img = generate_image(combined_prompt)
+        url = upload_tmpfile(img, "regen.png")
+    except Exception as e:
+        raise HTTPException(500, f"Erreur génération: {str(e)}")
+
+    return store_media(
+        texte=prev["texte"],
+        media_url=url,
+        media_type="image",
+        media_prompt=req.new_prompt,
+        media_description="Image régénérée",
+        parent_id=prev["id"]
+    )
+
+@app.get("/history")
+def get_history():
+    """Récupère l'historique des médias générés"""
+    return load_history()
+
+@app.delete("/history/{media_id}")
+def delete_media(media_id: str):
+    """Marque un média comme oublié"""
+    h = load_history()
+    media = next((x for x in h if x["id"] == media_id), None)
+    if not media:
+        raise HTTPException(404, "Média introuvable")
+    media["forgotten"] = True
+    save_history(h)
+    return {"message": "Média marqué comme oublié"}
